@@ -1,0 +1,1 @@
+run this script using the logged-on credentials, signature check and run the script in 64-bit PowerShell are all set to No
