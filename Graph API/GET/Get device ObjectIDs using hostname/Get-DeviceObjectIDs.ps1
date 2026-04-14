@@ -59,8 +59,6 @@
 #                  3. Upload the _BulkImport.txt file
 #                  4. Review and confirm
 #
-# Author       : Endpoint Engineering Team
-# Team         : Endpoint Engineering - Western Digital
 # Version      : 1.0
 # Created Date : 2026-04-14
 #
