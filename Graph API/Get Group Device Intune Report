@@ -1,0 +1,933 @@
+# Requires -Version 5.1
+# ==============================================================================
+# Script Name  : Get-GroupDeviceIntuneReport.ps1
+# Description  : Given an Azure AD / Entra Group ID, pulls all device members
+#                from that group, then searches Intune and Azure AD for every
+#                device by hostname. Cross-references all records and identifies
+#                the single UNIQUE ACTIVE Intune entry per device.
+#
+#                Produces THREE output files:
+#                  1. Full CSV report — one row per entry with verdicts,
+#                     GroupAction column, and full cross-reference data
+#                  2. BulkRemove TXT — AAD Object IDs to remove from group
+#                     (ready for Entra portal Bulk Remove upload)
+#                  3. Log file — full transcript of the run
+#
+#                WHY THIS SCRIPT EXISTS:
+#                  A static group may contain stale/duplicate AAD device objects
+#                  from old enrollments. This script identifies exactly which
+#                  objects should stay in the group (one clean record per device)
+#                  and which should be removed — so policy assignment and
+#                  compliance reporting are accurate.
+#
+#                HOW IT WORKS:
+#                  1. Detect group type (Security / Intune Device group)
+#                  2. Pull all device members from the group (paginated)
+#                  3. For each device hostname:
+#                     a. Search Intune  — all matching managed device records
+#                     b. Search Azure AD — all matching device objects
+#                     c. Cross-reference using AADDeviceId
+#                     d. Elect ONE "Unique Active" Intune entry per hostname
+#                        (newest enrolled date; fallback = most recent last sync)
+#                     e. Assign VERDICT and GroupAction per row
+#                  4. Export full CSV report
+#                  5. Export BulkRemove TXT (Object IDs only)
+#                  6. Print console summary + save log
+#
+#                ACTIVE ENTRY ELECTION (per hostname):
+#                  Among all Intune records for a hostname:
+#                    Primary  → newest enrolledDateTime
+#                    Fallback → most recent lastSyncDateTime
+#                              (used when enrolled dates are equal or missing)
+#
+#                VERDICT per row:
+#
+#                  Intune rows:
+#                    UNIQUE ACTIVE  — elected active Intune record (use for policy)
+#                    KEEP           — only one Intune record, no duplicate
+#                    DELETE         — older duplicate Intune record
+#                    REVIEW         — cannot determine which is newer
+#
+#                  Azure AD rows:
+#                    KEEP (ACTIVE)  — linked to the active Intune record
+#                    DELETE         — orphaned AAD object (no Intune link)
+#                    REVIEW         — ambiguous — shown in BOTH GroupAction buckets
+#
+#                GroupAction column:
+#                  KEEP IN GROUP      — clean, authoritative record
+#                  REMOVE FROM GROUP  — stale/duplicate, safe to remove
+#                  REVIEW — KEEP?     — REVIEW row shown as possible keep option
+#                  REVIEW — REMOVE?   — REVIEW row shown as possible remove option
+#
+#                  REVIEW rows appear TWICE in the CSV (once per action option)
+#                  so you can decide which line to act on before Bulk Remove.
+#
+#                BULK REMOVE TXT:
+#                  Contains only AAD Object IDs from rows where
+#                  GroupAction = "REMOVE FROM GROUP".
+#                  Upload directly to Entra portal → Group → Members → Bulk Remove.
+#                  REVIEW rows are NOT included — add manually after reviewing CSV.
+#
+#                CSV COLUMNS:
+#                  VERDICT, VerdictReason, GroupAction,
+#                  IsUniqueActiveIntuneEntry,
+#                  Hostname, Source, SerialNumber,
+#                  IntuneDeviceID, AADObjectID, AADDeviceID,
+#                  PrimaryUser, EnrolledDate, RegisteredDate,
+#                  LastSync, LastActivity, DaysSinceSync,
+#                  ComplianceState, ManagementState, OS,
+#                  LinkedToIntune, LinkedAADObjectID,
+#                  DuplicateCount_Intune, DuplicateCount_AAD
+#
+#                INPUT:
+#                  $GroupID — set in the CONFIGURATION region below.
+#
+#                OUTPUT FILES (saved to $PSScriptRoot by default):
+#                  Get-GroupDeviceIntuneReport_[timestamp].csv
+#                  Get-GroupDeviceIntuneReport_[timestamp]_BulkRemove.txt
+#                  Get-GroupDeviceIntuneReport_[timestamp].log
+#
+# Author       : Endpoint Engineering Team
+# Team         : Endpoint Engineering — Western Digital
+# Version      : 2.0
+# Created Date : 2026-04-13
+#
+# Requirements :
+#   - Azure AD App Registration
+#   - Graph API Application Permissions (admin consent granted):
+#       GroupMember.Read.All                     — read group members
+#       DeviceManagementManagedDevices.Read.All  — search Intune records
+#       Device.Read.All                          — search Azure AD objects
+#   - PowerShell 5.1 or later
+#
+# Change Log   :
+#   v1.0 - 2026-04-13 - Endpoint Engineering Team - Initial release.
+#   v2.0 - 2026-04-13 - Endpoint Engineering Team - Added GroupAction column.
+#                        REVIEW rows shown twice (KEEP? and REMOVE?) in CSV.
+#                        Added BulkRemove TXT export for Entra portal upload.
+#                        REVIEW rows excluded from BulkRemove TXT by default.
+# ==============================================================================
+
+
+#region ─── CONFIGURATION ────────────────────────────────────────────────────
+
+$TenantID     = ""
+$ClientID     = ""
+$ClientSecret = ""
+
+# ── GROUP ID ──────────────────────────────────────────────────────────────────
+# Paste the Azure AD / Entra Group Object ID here.
+# Works for both Security groups and Intune Device groups.
+# ─────────────────────────────────────────────────────────────────────────────
+$GroupID = ""
+
+# ── OUTPUT PATH ───────────────────────────────────────────────────────────────
+# Leave blank to save all output files to the same folder as this script.
+# Set a full path to override: e.g. "C:\Reports"
+# ─────────────────────────────────────────────────────────────────────────────
+$OutputFolder = ""
+
+#endregion ───────────────────────────────────────────────────────────────────
+
+
+#region ─── FUNCTIONS ────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCTION : Write-Log
+# Purpose  : Writes timestamped colour-coded messages to console and log file.
+# ─────────────────────────────────────────────────────────────────────────────
+function Write-Log {
+    param (
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Message,
+        [ValidateSet("INFO","SUCCESS","WARN","ERROR","SECTION","BLANK")]
+        [string]$Level = "INFO"
+    )
+    $ColourMap = @{
+        INFO    = "Gray";  SUCCESS = "Green"; WARN  = "Yellow"
+        ERROR   = "Red";   SECTION = "Cyan";  BLANK = "Gray"
+    }
+    $PrefixMap = @{
+        INFO    = "[INFO]   "; SUCCESS = "[OK]     "; WARN    = "[WARN]   "
+        ERROR   = "[ERROR]  "; SECTION = "[=======]"; BLANK   = "         "
+    }
+    $t = Get-Date -Format "HH:mm:ss"
+    if     ($Level -eq "BLANK")   { Write-Host "" }
+    elseif ($Level -eq "SECTION") { Write-Host "`n$Message" -ForegroundColor Cyan }
+    else   { Write-Host "[$t] $($PrefixMap[$Level]) $Message" -ForegroundColor $ColourMap[$Level] }
+
+    if ($script:LogFile) {
+        try {
+            Add-Content -Path $script:LogFile `
+                -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $($PrefixMap[$Level]) $Message" `
+                -Encoding UTF8
+        } catch { }
+    }
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCTION : Get-GraphAccessToken
+# Purpose  : Authenticates via client credentials and returns a bearer token.
+# ─────────────────────────────────────────────────────────────────────────────
+function Get-GraphAccessToken {
+    param ([string]$TenantId, [string]$ClientId, [string]$ClientSecret)
+    $Body = @{
+        grant_type    = "client_credentials"
+        client_id     = $ClientId
+        client_secret = $ClientSecret
+        scope         = "https://graph.microsoft.com/.default"
+    }
+    try {
+        Write-Log "Requesting access token..." -Level INFO
+        $r = Invoke-RestMethod -Method POST `
+             -ContentType "application/x-www-form-urlencoded" `
+             -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+             -Body $Body -ErrorAction Stop
+        Write-Log "Access token acquired." -Level SUCCESS
+        return $r.access_token
+    }
+    catch {
+        Write-Log "Authentication failed: $_" -Level ERROR
+        exit 1
+    }
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCTION : Invoke-GraphGetAllPages
+# Purpose  : Handles OData pagination and returns ALL results as a flat array.
+# ─────────────────────────────────────────────────────────────────────────────
+function Invoke-GraphGetAllPages {
+    param ([string]$Uri, [hashtable]$Headers)
+
+    $AllItems = [System.Collections.Generic.List[PSObject]]::new()
+    $NextUri  = $Uri
+
+    do {
+        try {
+            $Response = Invoke-RestMethod -Method GET -Uri $NextUri -Headers $Headers -ErrorAction Stop
+            if ($Response.value) { foreach ($item in $Response.value) { $AllItems.Add($item) } }
+            $NextUri = $Response.'@odata.nextLink'
+        }
+        catch {
+            Write-Log "Graph paged request failed: $_" -Level WARN
+            break
+        }
+    } while ($NextUri)
+
+    return $AllItems.ToArray()
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCTION : Get-GroupInfo
+# Purpose  : Fetches group display name and type metadata.
+# ─────────────────────────────────────────────────────────────────────────────
+function Get-GroupInfo {
+    param ([string]$GroupId, [string]$AccessToken)
+
+    $Headers = @{ Authorization = "Bearer $AccessToken"; "Content-Type" = "application/json" }
+    $Uri     = "https://graph.microsoft.com/v1.0/groups/$GroupId" +
+               "?`$select=id,displayName,groupTypes,membershipRule,mailEnabled,securityEnabled"
+    try {
+        return Invoke-RestMethod -Method GET -Uri $Uri -Headers $Headers -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Failed to fetch group info for ID '$GroupId': $_" -Level ERROR
+        exit 1
+    }
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCTION : Get-GroupDeviceMembers
+# Purpose  : Returns all DEVICE objects that are members of the given group.
+#            Tries server-side device filter first, falls back to client-side.
+# ─────────────────────────────────────────────────────────────────────────────
+function Get-GroupDeviceMembers {
+    param ([string]$GroupId, [string]$AccessToken)
+
+    $Headers = @{ Authorization = "Bearer $AccessToken"; "Content-Type" = "application/json" }
+
+    $Uri = "https://graph.microsoft.com/v1.0/groups/$GroupId/members" +
+           "/microsoft.graph.device" +
+           "?`$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion," +
+           "registrationDateTime,approximateLastSignInDateTime,isCompliant,managementType,physicalIds" +
+           "&`$top=999"
+    try {
+        $Devices = Invoke-GraphGetAllPages -Uri $Uri -Headers $Headers
+        if ($Devices -and $Devices.Count -gt 0) {
+            Write-Log "  Group member fetch: $($Devices.Count) device objects (server-side filtered)." -Level SUCCESS
+            return $Devices
+        }
+    }
+    catch {
+        Write-Log "  Server-side device filter failed, falling back to full member pull..." -Level WARN
+    }
+
+    $FallbackUri = "https://graph.microsoft.com/v1.0/groups/$GroupId/members" +
+                   "?`$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion," +
+                   "registrationDateTime,approximateLastSignInDateTime,isCompliant,managementType,physicalIds" +
+                   "&`$top=999"
+    $AllMembers = Invoke-GraphGetAllPages -Uri $FallbackUri -Headers $Headers
+    $DeviceOnly = @($AllMembers | Where-Object { $_.'@odata.type' -eq "#microsoft.graph.device" -or $_.deviceId })
+    Write-Log "  Group member fetch: $($AllMembers.Count) total members, $($DeviceOnly.Count) are devices (client-side filtered)." -Level SUCCESS
+    return $DeviceOnly
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCTION : Get-IntuneRecordsByHostname
+# Purpose  : Returns ALL Intune managed device records matching a hostname.
+# ─────────────────────────────────────────────────────────────────────────────
+function Get-IntuneRecordsByHostname {
+    param ([string]$Hostname, [string]$AccessToken)
+
+    $Headers  = @{ Authorization = "Bearer $AccessToken"; "Content-Type" = "application/json" }
+    $SafeName = $Hostname -replace "'", "''"
+    $Uri      = "https://graph.microsoft.com/beta/deviceManagement/managedDevices" +
+                "?`$filter=deviceName eq '$SafeName'"
+    try {
+        $r = Invoke-RestMethod -Method GET -Uri $Uri -Headers $Headers -ErrorAction Stop
+        return @($r.value)
+    }
+    catch {
+        Write-Log "  Intune search failed for '$Hostname': $_" -Level WARN
+        return @()
+    }
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCTION : Get-AADObjectsByHostname
+# Purpose  : Returns ALL Azure AD device objects matching a hostname.
+# ─────────────────────────────────────────────────────────────────────────────
+function Get-AADObjectsByHostname {
+    param ([string]$Hostname, [string]$AccessToken)
+
+    $Headers  = @{ Authorization = "Bearer $AccessToken"; "Content-Type" = "application/json" }
+    $SafeName = $Hostname -replace "'", "''"
+    $Uri      = "https://graph.microsoft.com/v1.0/devices" +
+                "?`$filter=displayName eq '$SafeName'" +
+                "&`$select=id,deviceId,displayName,registrationDateTime," +
+                "approximateLastSignInDateTime,operatingSystem,operatingSystemVersion," +
+                "isCompliant,managementType,physicalIds"
+    try {
+        $r = Invoke-RestMethod -Method GET -Uri $Uri -Headers $Headers -ErrorAction Stop
+        return @($r.value)
+    }
+    catch {
+        Write-Log "  Azure AD search failed for '$Hostname': $_" -Level WARN
+        return @()
+    }
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCTION : Get-SerialFromPhysicalIds
+# Purpose  : Extracts serial number from AAD physicalIds array.
+# ─────────────────────────────────────────────────────────────────────────────
+function Get-SerialFromPhysicalIds {
+    param ([array]$PhysicalIds)
+    if (-not $PhysicalIds -or $PhysicalIds.Count -eq 0) { return "" }
+    foreach ($e in $PhysicalIds) {
+        if ($e -match '^\[SerialNumber\]:(.+)$') { return $Matches[1].Trim() }
+    }
+    foreach ($e in $PhysicalIds) {
+        if ($e -match '^\[OrderID\]:(.+)$') { return $Matches[1].Trim() }
+    }
+    return ""
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCTION : Get-DaysSince
+# Purpose  : Returns days since an ISO datetime string. 9999 = never/missing.
+# ─────────────────────────────────────────────────────────────────────────────
+function Get-DaysSince {
+    param ([string]$DateString)
+    if ([string]::IsNullOrWhiteSpace($DateString) -or $DateString -like "0001*") { return 9999 }
+    try {
+        $dt = [datetime]::Parse($DateString, $null,
+              [System.Globalization.DateTimeStyles]::RoundtripKind)
+        return [math]::Round(((Get-Date) - $dt).TotalDays, 1)
+    }
+    catch { return 9999 }
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCTION : Format-Date
+# Purpose  : Formats ISO datetime to readable yyyy-MM-dd HH:mm.
+# ─────────────────────────────────────────────────────────────────────────────
+function Format-Date {
+    param ([string]$DateString)
+    if ([string]::IsNullOrWhiteSpace($DateString) -or $DateString -like "0001*") { return "Never" }
+    try {
+        return ([datetime]::Parse($DateString, $null,
+            [System.Globalization.DateTimeStyles]::RoundtripKind)).ToString("yyyy-MM-dd HH:mm")
+    }
+    catch { return $DateString }
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCTION : Select-UniqueActiveIntuneRecord
+# Purpose  : Elects the single UNIQUE ACTIVE Intune record from a list.
+#            Priority: newest enrolledDateTime → fallback: newest lastSyncDateTime
+# ─────────────────────────────────────────────────────────────────────────────
+function Select-UniqueActiveIntuneRecord {
+    param ([array]$IntuneRecords)
+
+    if ($IntuneRecords.Count -eq 0) { return $null }
+    if ($IntuneRecords.Count -eq 1) { return $IntuneRecords[0] }
+
+    $WithDates = $IntuneRecords | ForEach-Object {
+        $rec      = $_
+        $enrolled = [datetime]::MinValue
+        $synced   = [datetime]::MinValue
+        if ($rec.enrolledDateTime -and $rec.enrolledDateTime -notlike "0001*") {
+            try { $enrolled = [datetime]::Parse($rec.enrolledDateTime, $null,
+                  [System.Globalization.DateTimeStyles]::RoundtripKind) } catch {}
+        }
+        if ($rec.lastSyncDateTime -and $rec.lastSyncDateTime -notlike "0001*") {
+            try { $synced = [datetime]::Parse($rec.lastSyncDateTime, $null,
+                  [System.Globalization.DateTimeStyles]::RoundtripKind) } catch {}
+        }
+        [PSCustomObject]@{ Record = $rec; Enrolled = $enrolled; Synced = $synced }
+    }
+
+    $Sorted = $WithDates | Sort-Object -Property Enrolled, Synced -Descending
+    return $Sorted[0].Record
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCTION : New-DeviceRow
+# Purpose  : Helper — builds a consistent PSCustomObject row for the CSV.
+# ─────────────────────────────────────────────────────────────────────────────
+function New-DeviceRow {
+    param (
+        [string]$Verdict,           [string]$VerdictReason,
+        [string]$GroupAction,       [string]$IsUniqueActive,
+        [string]$Hostname,          [string]$Source,
+        [string]$SerialNumber,      [string]$IntuneDeviceID,
+        [string]$AADObjectID,       [string]$AADDeviceID,
+        [string]$PrimaryUser,       [string]$EnrolledDate,
+        [string]$RegisteredDate,    [string]$LastSync,
+        [string]$LastActivity,      $DaysSinceSync,
+        [string]$ComplianceState,   [string]$ManagementState,
+        [string]$OS,                [string]$LinkedToIntune,
+        [string]$LinkedAADObjectID, $DuplicateCount_Intune,
+        $DuplicateCount_AAD
+    )
+    return [PSCustomObject]@{
+        VERDICT                   = $Verdict
+        VerdictReason             = $VerdictReason
+        GroupAction               = $GroupAction
+        IsUniqueActiveIntuneEntry = $IsUniqueActive
+        Hostname                  = $Hostname
+        Source                    = $Source
+        SerialNumber              = $SerialNumber
+        IntuneDeviceID            = $IntuneDeviceID
+        AADObjectID               = $AADObjectID
+        AADDeviceID               = $AADDeviceID
+        PrimaryUser               = $PrimaryUser
+        EnrolledDate              = $EnrolledDate
+        RegisteredDate            = $RegisteredDate
+        LastSync                  = $LastSync
+        LastActivity              = $LastActivity
+        DaysSinceSync             = $DaysSinceSync
+        ComplianceState           = $ComplianceState
+        ManagementState           = $ManagementState
+        OS                        = $OS
+        LinkedToIntune            = $LinkedToIntune
+        LinkedAADObjectID         = $LinkedAADObjectID
+        DuplicateCount_Intune     = $DuplicateCount_Intune
+        DuplicateCount_AAD        = $DuplicateCount_AAD
+    }
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCTION : Resolve-DeviceEntries
+# Purpose  : Core logic per hostname.
+#            Builds CSV rows with VERDICT and GroupAction.
+#            Returns Rows list and BulkRemoveIDs list.
+#
+#            GroupAction rules:
+#              KEEP IN GROUP      → VERDICT is KEEP or UNIQUE ACTIVE or KEEP (ACTIVE)
+#              REMOVE FROM GROUP  → VERDICT is DELETE
+#              REVIEW rows        → appear TWICE in CSV:
+#                                    "REVIEW — KEEP?"   (user keeps if they want)
+#                                    "REVIEW — REMOVE?" (user removes if they want)
+#                                   NOT added to BulkRemove TXT automatically.
+# ─────────────────────────────────────────────────────────────────────────────
+function Resolve-DeviceEntries {
+    param (
+        [string]$Hostname,
+        [array]$IntuneRecords,
+        [array]$AADObjects
+    )
+
+    $Rows          = [System.Collections.Generic.List[PSObject]]::new()
+    $BulkRemoveIDs = [System.Collections.Generic.List[string]]::new()
+
+    # Elect the single unique active Intune record
+    $ActiveIntuneRecord = Select-UniqueActiveIntuneRecord -IntuneRecords $IntuneRecords
+    $ActiveIntuneID     = if ($ActiveIntuneRecord) { $ActiveIntuneRecord.id } else { $null }
+
+    # Build lookup: AADDeviceId (lowercase) → Intune record
+    $IntuneByAADDeviceId = @{}
+    foreach ($rec in $IntuneRecords) {
+        if (-not [string]::IsNullOrWhiteSpace($rec.azureADDeviceId)) {
+            $IntuneByAADDeviceId[$rec.azureADDeviceId.ToLower()] = $rec
+        }
+    }
+
+    # Build lookup: AAD DeviceId (lowercase) → AAD Object
+    $AADByDeviceId = @{}
+    foreach ($aad in $AADObjects) {
+        if (-not [string]::IsNullOrWhiteSpace($aad.deviceId)) {
+            $AADByDeviceId[$aad.deviceId.ToLower()] = $aad
+        }
+    }
+
+    # Sort Intune — newest enrolled first (active entry appears first in CSV)
+    $SortedIntune = @($IntuneRecords | Sort-Object {
+        if ($_.enrolledDateTime -and $_.enrolledDateTime -notlike "0001*") {
+            [datetime]::Parse($_.enrolledDateTime, $null,
+                [System.Globalization.DateTimeStyles]::RoundtripKind)
+        } else { [datetime]::MinValue }
+    } -Descending)
+
+    # Sort AAD — newest registered first
+    $SortedAAD = @($AADObjects | Sort-Object {
+        if ($_.registrationDateTime) {
+            [datetime]::Parse($_.registrationDateTime, $null,
+                [System.Globalization.DateTimeStyles]::RoundtripKind)
+        } else { [datetime]::MinValue }
+    } -Descending)
+
+    $IntuneCount = $IntuneRecords.Count
+    $AADCount    = $AADObjects.Count
+
+    # ── Process Intune rows ───────────────────────────────────────────────────
+    foreach ($Rec in $SortedIntune) {
+
+        $DaysSince      = Get-DaysSince -DateString $Rec.lastSyncDateTime
+        $IsActiveRecord = ($Rec.id -eq $ActiveIntuneID)
+
+        $LinkedAADObjID = "None"
+        if (-not [string]::IsNullOrWhiteSpace($Rec.azureADDeviceId)) {
+            $key = $Rec.azureADDeviceId.ToLower()
+            if ($AADByDeviceId.ContainsKey($key)) { $LinkedAADObjID = $AADByDeviceId[$key].id }
+        }
+
+        $Verdict = ""; $VerdictReason = ""; $GroupAction = ""
+
+        if ($IntuneCount -eq 1) {
+            $Verdict       = "KEEP"
+            $VerdictReason = "Only Intune record for this hostname — no duplicate detected"
+            $GroupAction   = "KEEP IN GROUP"
+        }
+        elseif ($IsActiveRecord) {
+            $Verdict       = "UNIQUE ACTIVE"
+            $VerdictReason = "Elected as unique active entry — newest enrollment. Use this IntuneDeviceID for policy assignment"
+            $GroupAction   = "KEEP IN GROUP"
+        }
+        else {
+            $Verdict       = "DELETE"
+            $VerdictReason = "Older duplicate Intune record — use IntuneDevice-Delete.ps1 with IntuneDeviceID"
+            $GroupAction   = "REMOVE FROM GROUP"
+        }
+
+        $Rows.Add((New-DeviceRow `
+            -Verdict $Verdict -VerdictReason $VerdictReason -GroupAction $GroupAction `
+            -IsUniqueActive $(if ($IsActiveRecord -or $IntuneCount -eq 1) { "YES" } else { "NO" }) `
+            -Hostname $Hostname -Source "Intune" `
+            -SerialNumber $Rec.serialNumber `
+            -IntuneDeviceID $Rec.id `
+            -AADObjectID "N/A — Intune row" `
+            -AADDeviceID $Rec.azureADDeviceId `
+            -PrimaryUser $Rec.userPrincipalName `
+            -EnrolledDate (Format-Date $Rec.enrolledDateTime) `
+            -RegisteredDate "N/A — Intune row" `
+            -LastSync (Format-Date $Rec.lastSyncDateTime) `
+            -LastActivity "N/A — Intune row" `
+            -DaysSinceSync $DaysSince `
+            -ComplianceState $Rec.complianceState `
+            -ManagementState $Rec.managementState `
+            -OS "$($Rec.operatingSystem) $($Rec.osVersion)".Trim() `
+            -LinkedToIntune "YES — this IS the Intune record" `
+            -LinkedAADObjectID $LinkedAADObjID `
+            -DuplicateCount_Intune $IntuneCount `
+            -DuplicateCount_AAD $AADCount
+        ))
+    }
+
+    # ── Process Azure AD rows ─────────────────────────────────────────────────
+    foreach ($AAD in $SortedAAD) {
+
+        $Serial            = Get-SerialFromPhysicalIds -PhysicalIds $AAD.physicalIds
+        $DaysSinceActivity = Get-DaysSince -DateString $AAD.approximateLastSignInDateTime
+
+        $IsLinked       = $false
+        $LinkedIntuneID = "None"
+        if (-not [string]::IsNullOrWhiteSpace($AAD.deviceId)) {
+            $key = $AAD.deviceId.ToLower()
+            if ($IntuneByAADDeviceId.ContainsKey($key)) {
+                $IsLinked       = $true
+                $LinkedIntuneID = $IntuneByAADDeviceId[$key].id
+            }
+        }
+
+        $IsLinkedToActive = ($IsLinked -and $LinkedIntuneID -eq $ActiveIntuneID)
+        $IsReview         = $false
+        $Verdict          = ""; $VerdictReason = ""; $GroupAction = ""
+
+        if ($AADCount -eq 1 -and $IsLinked) {
+            $Verdict       = "KEEP"
+            $VerdictReason = "Only AAD object — linked to Intune record $LinkedIntuneID"
+            $GroupAction   = "KEEP IN GROUP"
+        }
+        elseif ($IsLinkedToActive -and $DaysSinceActivity -le 90) {
+            $Verdict       = "KEEP (ACTIVE)"
+            $VerdictReason = "Linked to UNIQUE ACTIVE Intune record $LinkedIntuneID — last activity ${DaysSinceActivity}d ago"
+            $GroupAction   = "KEEP IN GROUP"
+        }
+        elseif ($IsLinked -and $DaysSinceActivity -gt 90) {
+            $Verdict       = "REVIEW"
+            $VerdictReason = "Linked to Intune but last activity ${DaysSinceActivity}d ago — verify before acting"
+            $IsReview      = $true
+        }
+        elseif ($IsLinked -and -not $IsLinkedToActive) {
+            $Verdict       = "REVIEW"
+            $VerdictReason = "Linked to a non-active Intune record ($LinkedIntuneID) — consider cleanup"
+            $IsReview      = $true
+        }
+        elseif (-not $IsLinked -and $AADCount -gt 1) {
+            $Verdict       = "DELETE"
+            $VerdictReason = "NOT linked to any Intune record — stale orphaned AAD object. Use IntuneStaleEnrollments-Delete.ps1 with AADObjectID"
+            $GroupAction   = "REMOVE FROM GROUP"
+        }
+        elseif (-not $IsLinked -and $AADCount -eq 1) {
+            $Verdict       = "REVIEW"
+            $VerdictReason = "Only AAD object but not linked to any Intune record — device may not be enrolled"
+            $IsReview      = $true
+        }
+        else {
+            $Verdict       = "REVIEW"
+            $VerdictReason = "Could not determine status — verify manually in Entra portal"
+            $IsReview      = $true
+        }
+
+        # Shared params for New-DeviceRow
+        $RowParams = @{
+            Verdict               = $Verdict
+            VerdictReason         = $VerdictReason
+            IsUniqueActive        = "N/A — Azure AD row"
+            Hostname              = $Hostname
+            Source                = "Azure AD"
+            SerialNumber          = $Serial
+            IntuneDeviceID        = "N/A — Azure AD row"
+            AADObjectID           = $AAD.id
+            AADDeviceID           = $AAD.deviceId
+            PrimaryUser           = "N/A — check Intune row"
+            EnrolledDate          = "N/A — Azure AD row"
+            RegisteredDate        = Format-Date $AAD.registrationDateTime
+            LastSync              = "N/A — Azure AD row"
+            LastActivity          = Format-Date $AAD.approximateLastSignInDateTime
+            DaysSinceSync         = "N/A — Azure AD row"
+            ComplianceState       = if ($AAD.isCompliant) { "Compliant" } else { "Non-compliant" }
+            ManagementState       = $AAD.managementType
+            OS                    = "$($AAD.operatingSystem) $($AAD.operatingSystemVersion)".Trim()
+            LinkedToIntune        = if ($IsLinked) { "YES — linked to Intune ID: $LinkedIntuneID" } else { "NO — orphaned AAD object" }
+            LinkedAADObjectID     = "N/A — Azure AD row"
+            DuplicateCount_Intune = $IntuneCount
+            DuplicateCount_AAD    = $AADCount
+        }
+
+        if ($IsReview) {
+            # REVIEW rows appear TWICE — user picks which action to take
+            $Rows.Add((New-DeviceRow @RowParams -GroupAction "REVIEW — KEEP?"))
+            $Rows.Add((New-DeviceRow @RowParams -GroupAction "REVIEW — REMOVE?"))
+            # NOT added to BulkRemove TXT — user must decide manually
+        }
+        else {
+            $Rows.Add((New-DeviceRow @RowParams -GroupAction $GroupAction))
+
+            # Add to BulkRemove TXT if definitive REMOVE and has a real AAD Object ID
+            if ($GroupAction -eq "REMOVE FROM GROUP" `
+                -and -not [string]::IsNullOrWhiteSpace($AAD.id) `
+                -and $AAD.id -ne "N/A — Azure AD row") {
+                $BulkRemoveIDs.Add($AAD.id)
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Rows          = $Rows
+        BulkRemoveIDs = $BulkRemoveIDs
+    }
+}
+
+#endregion ───────────────────────────────────────────────────────────────────
+
+
+#region ─── MAIN ─────────────────────────────────────────────────────────────
+
+# ── Validate config ───────────────────────────────────────────────────────────
+if ([string]::IsNullOrWhiteSpace($GroupID)) {
+    Write-Host "[ERROR]   GroupID is not set. Edit the CONFIGURATION region and add your Group Object ID." -ForegroundColor Red
+    exit 1
+}
+
+# ── Initialise output paths ───────────────────────────────────────────────────
+$Timestamp      = Get-Date -Format "yyyyMMdd_HHmmss"
+$ResolvedOutput = if ([string]::IsNullOrWhiteSpace($OutputFolder)) { $PSScriptRoot } else { $OutputFolder }
+if (-not (Test-Path $ResolvedOutput)) {
+    New-Item -ItemType Directory -Path $ResolvedOutput -Force | Out-Null
+}
+
+$OutputFile     = Join-Path $ResolvedOutput ("Get-GroupDeviceIntuneReport_" + $Timestamp + ".csv")
+$BulkRemoveFile = Join-Path $ResolvedOutput ("Get-GroupDeviceIntuneReport_" + $Timestamp + "_BulkRemove.txt")
+$script:LogFile = Join-Path $ResolvedOutput ("Get-GroupDeviceIntuneReport_" + $Timestamp + ".log")
+
+try {
+    [System.IO.File]::WriteAllText(
+        $script:LogFile,
+        "Get-GroupDeviceIntuneReport v2.0`r`nStarted : $(Get-Date)`r`nGroup ID: $GroupID`r`n`r`n",
+        [System.Text.Encoding]::UTF8
+    )
+} catch { $script:LogFile = $null }
+
+# ── Banner ────────────────────────────────────────────────────────────────────
+Write-Host ""
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host "  Get-GroupDeviceIntuneReport v2.0  |  READ ONLY               " -ForegroundColor Cyan
+Write-Host "  Endpoint Engineering Team  |  Western Digital                " -ForegroundColor Cyan
+Write-Host "  Identifies which group members to keep vs remove.            " -ForegroundColor Cyan
+Write-Host "  Produces BulkRemove TXT ready for Entra portal upload.       " -ForegroundColor Cyan
+Write-Host "  NO changes made to the group or any device records.          " -ForegroundColor Cyan
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Log "" -Level BLANK
+Write-Log "Group ID        : $GroupID"          -Level INFO
+Write-Log "Output CSV      : $OutputFile"        -Level INFO
+Write-Log "BulkRemove TXT  : $BulkRemoveFile"    -Level INFO
+Write-Log "Log file        : $($script:LogFile)" -Level INFO
+
+# ── STEP 1: Authenticate ──────────────────────────────────────────────────────
+Write-Log "==========================================================" -Level SECTION
+Write-Log "STEP 1 — Authenticating" -Level INFO
+Write-Log "==========================================================" -Level SECTION
+
+$Token = Get-GraphAccessToken -TenantId $TenantID -ClientId $ClientID -ClientSecret $ClientSecret
+
+# ── STEP 2: Get group info ────────────────────────────────────────────────────
+Write-Log "==========================================================" -Level SECTION
+Write-Log "STEP 2 — Fetching Group Info" -Level INFO
+Write-Log "==========================================================" -Level SECTION
+
+$GroupInfo = Get-GroupInfo -GroupId $GroupID -AccessToken $Token
+
+$IsIntuneDynamic = ($GroupInfo.groupTypes -contains "DynamicMembership") -and
+                   ($GroupInfo.membershipRule -match "deviceManagementAppId|deviceEnrollmentType|deviceOSType|device\.")
+$GroupTypeLabel  = if ($IsIntuneDynamic) { "Intune Dynamic Device Group" } else { "Azure AD Security Group (Static)" }
+
+Write-Log "Group Name : $($GroupInfo.displayName)" -Level SUCCESS
+Write-Log "Group Type : $GroupTypeLabel"            -Level INFO
+Write-Log "Group ID   : $($GroupInfo.id)"           -Level INFO
+
+# ── STEP 3: Pull all device members ──────────────────────────────────────────
+Write-Log "==========================================================" -Level SECTION
+Write-Log "STEP 3 — Pulling Device Members from Group" -Level INFO
+Write-Log "==========================================================" -Level SECTION
+
+$GroupDevices = Get-GroupDeviceMembers -GroupId $GroupID -AccessToken $Token
+
+if (-not $GroupDevices -or $GroupDevices.Count -eq 0) {
+    Write-Log "No device members found in group '$($GroupInfo.displayName)'. Exiting." -Level ERROR
+    exit 1
+}
+
+$UniqueHostnames = @($GroupDevices | Where-Object { $_.displayName } |
+    Select-Object -ExpandProperty displayName | Sort-Object -Unique)
+
+Write-Log "Total device members in group : $($GroupDevices.Count)"  -Level SUCCESS
+Write-Log "Unique hostnames to process   : $($UniqueHostnames.Count)" -Level SUCCESS
+
+# ── STEP 4: Search Intune + Azure AD per hostname ─────────────────────────────
+Write-Log "==========================================================" -Level SECTION
+Write-Log "STEP 4 — Searching Intune and Azure AD per Device" -Level INFO
+Write-Log "==========================================================" -Level SECTION
+
+$AllResults       = [System.Collections.Generic.List[PSObject]]::new()
+$AllBulkRemoveIDs = [System.Collections.Generic.List[string]]::new()
+$Counter          = 0
+$Total            = $UniqueHostnames.Count
+$UniqueActiveCount = 0
+$KeepCount        = 0
+$DeleteCount      = 0
+$ReviewCount      = 0
+$NotFoundCount    = 0
+
+foreach ($Hostname in $UniqueHostnames) {
+
+    $Counter++
+    Write-Log "" -Level BLANK
+    Write-Log "  [$Counter/$Total] $Hostname" -Level WARN
+
+    Write-Log "    Searching Intune..." -Level INFO
+    $IntuneRecords = Get-IntuneRecordsByHostname -Hostname $Hostname -AccessToken $Token
+    Write-Log "    Intune records found  : $($IntuneRecords.Count)" `
+        -Level $(if ($IntuneRecords.Count -gt 1) { "WARN" } elseif ($IntuneRecords.Count -eq 1) { "SUCCESS" } else { "WARN" })
+
+    Write-Log "    Searching Azure AD..." -Level INFO
+    $AADObjects = Get-AADObjectsByHostname -Hostname $Hostname -AccessToken $Token
+    Write-Log "    Azure AD objects found: $($AADObjects.Count)" `
+        -Level $(if ($AADObjects.Count -gt 1) { "WARN" } elseif ($AADObjects.Count -eq 1) { "SUCCESS" } else { "WARN" })
+
+    if ($IntuneRecords.Count -eq 0 -and $AADObjects.Count -eq 0) {
+        Write-Log "    → NOT FOUND in Intune or Azure AD" -Level ERROR
+        $NotFoundCount++
+        $AllResults.Add((New-DeviceRow `
+            -Verdict "NOT FOUND" `
+            -VerdictReason "Hostname not found in Intune or Azure AD — check spelling or group membership" `
+            -GroupAction "REVIEW — KEEP?" `
+            -IsUniqueActive "N/A" `
+            -Hostname $Hostname -Source "NOT FOUND" `
+            -SerialNumber "" -IntuneDeviceID "" -AADObjectID "" -AADDeviceID "" `
+            -PrimaryUser "" -EnrolledDate "" -RegisteredDate "" `
+            -LastSync "" -LastActivity "" -DaysSinceSync "" `
+            -ComplianceState "" -ManagementState "" -OS "" `
+            -LinkedToIntune "" -LinkedAADObjectID "" `
+            -DuplicateCount_Intune 0 -DuplicateCount_AAD 0
+        ))
+        continue
+    }
+
+    $Result = Resolve-DeviceEntries `
+              -Hostname $Hostname `
+              -IntuneRecords $IntuneRecords `
+              -AADObjects $AADObjects
+
+    # Console output — skip the duplicate REVIEW — REMOVE? line to keep transcript clean
+    foreach ($Row in $Result.Rows) {
+        if ([string]::IsNullOrWhiteSpace($Row.Source)) { continue }
+        if ($Row.GroupAction -eq "REVIEW — REMOVE?") { continue }
+
+        $VColour = switch -Wildcard ($Row.VERDICT) {
+            "UNIQUE ACTIVE" { "SUCCESS" }
+            "KEEP*"         { "SUCCESS" }
+            "DELETE"        { "ERROR"   }
+            "REVIEW*"       { "WARN"    }
+            default         { "INFO"    }
+        }
+        $ActiveTag = if ($Row.IsUniqueActiveIntuneEntry -eq "YES") { " ★ UNIQUE ACTIVE" } else { "" }
+        Write-Log ("    [{0,-8}] Serial:{1,-14} VERDICT:{2}{3}" -f `
+            $Row.Source, $Row.SerialNumber, $Row.VERDICT, $ActiveTag) -Level $VColour
+        Write-Log "             Reason      : $($Row.VerdictReason)" -Level INFO
+        Write-Log "             GroupAction : $($Row.GroupAction)"   -Level INFO
+    }
+
+    foreach ($Row in $Result.Rows)  { $AllResults.Add($Row) }
+    foreach ($ID  in $Result.BulkRemoveIDs) { $AllBulkRemoveIDs.Add($ID) }
+
+    Start-Sleep -Milliseconds 300
+}
+
+# ── Tally verdicts (count each device once — exclude REVIEW — REMOVE? duplicates) ──
+$DataRows          = $AllResults | Where-Object {
+    $_.Source -ne "" -and $_.Source -ne "NOT FOUND" -and $_.GroupAction -ne "REVIEW — REMOVE?"
+}
+$UniqueActiveCount = @($DataRows | Where-Object { $_.VERDICT -eq "UNIQUE ACTIVE"  }).Count
+$KeepCount         = @($DataRows | Where-Object { $_.VERDICT -like "KEEP*"        }).Count
+$DeleteCount       = @($DataRows | Where-Object { $_.VERDICT -eq "DELETE"         }).Count
+$ReviewCount       = @($DataRows | Where-Object { $_.VERDICT -like "REVIEW*"      }).Count
+$KeepInGroup       = @($DataRows | Where-Object { $_.GroupAction -eq "KEEP IN GROUP"     }).Count
+$RemoveFromGroup   = @($DataRows | Where-Object { $_.GroupAction -eq "REMOVE FROM GROUP" }).Count
+$ReviewRows        = @($DataRows | Where-Object { $_.GroupAction -like "REVIEW*"         }).Count
+
+# ── STEP 5: Export CSV ────────────────────────────────────────────────────────
+Write-Log "" -Level BLANK
+Write-Log "==========================================================" -Level SECTION
+Write-Log "STEP 5 — Exporting CSV" -Level INFO
+Write-Log "==========================================================" -Level SECTION
+
+try {
+    $ExportRows = $AllResults | Where-Object { $_.Source -ne "" }
+    $ExportRows | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+    $SizeMB   = (((Get-Item $OutputFile).Length) / 1MB).ToString("0.00")
+    $RowCount  = ($ExportRows | Measure-Object).Count
+    Write-Log "CSV exported successfully." -Level SUCCESS
+    Write-Log "  Path : $OutputFile" -Level INFO
+    Write-Log "  Rows : $RowCount  (REVIEW rows counted twice — once per option)   Size: $SizeMB MB" -Level INFO
+}
+catch { Write-Log "CSV export failed: $_" -Level ERROR }
+
+# ── STEP 6: Export BulkRemove TXT ────────────────────────────────────────────
+Write-Log "" -Level BLANK
+Write-Log "==========================================================" -Level SECTION
+Write-Log "STEP 6 — Exporting BulkRemove TXT" -Level INFO
+Write-Log "==========================================================" -Level SECTION
+
+try {
+    if ($AllBulkRemoveIDs.Count -gt 0) {
+        [System.IO.File]::WriteAllLines(
+            $BulkRemoveFile,
+            $AllBulkRemoveIDs.ToArray(),
+            [System.Text.Encoding]::UTF8
+        )
+        Write-Log "BulkRemove TXT exported successfully." -Level SUCCESS
+        Write-Log "  Path       : $BulkRemoveFile"        -Level INFO
+        Write-Log "  Object IDs : $($AllBulkRemoveIDs.Count) (definitive REMOVE FROM GROUP only)" -Level INFO
+        Write-Log "  NOTE: REVIEW rows NOT included — add manually from CSV if needed." -Level WARN
+    }
+    else {
+        Write-Log "No definitive REMOVE FROM GROUP entries found — BulkRemove TXT not created." -Level WARN
+    }
+}
+catch { Write-Log "BulkRemove TXT export failed: $_" -Level ERROR }
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+Write-Host ""
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host "  COMPLETE — READ ONLY — NO CHANGES MADE                       " -ForegroundColor Cyan
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Log "  Group Name              : $($GroupInfo.displayName)" -Level INFO
+Write-Log "  Group ID                : $GroupID"                  -Level INFO
+Write-Log "  Devices in group        : $($GroupDevices.Count)"    -Level INFO
+Write-Log "  Unique hostnames        : $Total"                    -Level INFO
+Write-Log "  Not found               : $NotFoundCount" -Level $(if ($NotFoundCount -gt 0) { "WARN" } else { "INFO" })
+Write-Log "" -Level BLANK
+Write-Log "  ── Verdict breakdown ─────────────────────────────────────" -Level SECTION
+Write-Log "  UNIQUE ACTIVE           : $UniqueActiveCount" -Level $(if ($UniqueActiveCount -gt 0) { "SUCCESS" } else { "INFO" })
+Write-Log "  KEEP / KEEP (ACTIVE)    : $KeepCount"         -Level $(if ($KeepCount   -gt 0) { "SUCCESS" } else { "INFO" })
+Write-Log "  DELETE                  : $DeleteCount"        -Level $(if ($DeleteCount -gt 0) { "ERROR"   } else { "INFO" })
+Write-Log "  REVIEW                  : $ReviewCount"        -Level $(if ($ReviewCount -gt 0) { "WARN"    } else { "INFO" })
+Write-Log "" -Level BLANK
+Write-Log "  ── Group action breakdown ────────────────────────────────" -Level SECTION
+Write-Log "  KEEP IN GROUP           : $KeepInGroup"     -Level $(if ($KeepInGroup    -gt 0) { "SUCCESS" } else { "INFO" })
+Write-Log "  REMOVE FROM GROUP       : $RemoveFromGroup" -Level $(if ($RemoveFromGroup -gt 0) { "ERROR"   } else { "INFO" })
+Write-Log "  REVIEW (you decide)     : $ReviewRows"      -Level $(if ($ReviewRows      -gt 0) { "WARN"    } else { "INFO" })
+Write-Log "" -Level BLANK
+Write-Log "  ── How to use the BulkRemove TXT ────────────────────────" -Level SECTION
+Write-Log "  1. Open Entra portal → Groups → your group → Members"    -Level INFO
+Write-Log "  2. Click Bulk Remove → upload the BulkRemove TXT file"   -Level INFO
+Write-Log "  3. For REVIEW rows — check CSV, add Object IDs manually"  -Level INFO
+Write-Log "" -Level BLANK
+Write-Log "  ── How to read the CSV ───────────────────────────────────" -Level SECTION
+Write-Log "  GroupAction = KEEP IN GROUP     → stays in group"         -Level INFO
+Write-Log "  GroupAction = REMOVE FROM GROUP → in BulkRemove TXT"      -Level INFO
+Write-Log "  GroupAction = REVIEW — KEEP?    → your decision"          -Level INFO
+Write-Log "  GroupAction = REVIEW — REMOVE?  → your decision"          -Level INFO
+Write-Log "  IsUniqueActiveIntuneEntry = YES → use for policy assign"  -Level INFO
+Write-Log "" -Level BLANK
+Write-Log "  Output CSV      : $OutputFile"        -Level INFO
+Write-Log "  BulkRemove TXT  : $BulkRemoveFile"    -Level INFO
+Write-Log "  Log file        : $($script:LogFile)" -Level INFO
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host ""
+
+#endregion ───────────────────────────────────────────────────────────────────
