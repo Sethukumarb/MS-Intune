@@ -28,7 +28,7 @@
 
 .NOTES
     Script Name   : Detect-FirefoxVersionCompliance.ps1
-    Author        : <Your Name / Team Name>
+    Author        : Sethu Kumar B
     Version       : 2.0.0
     Created       : 2025-04-17
     Last Modified : 2025-04-17
