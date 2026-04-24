@@ -85,7 +85,7 @@ $ClientSecret = ""
 #          before setting $DryRun = $false.
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-$DryRun = $false
+$DryRun = $true
 
 # -- INPUT FILE ----------------------------------------------------------------
 $InputFileName = "remove_inputserialnumbers.txt"
