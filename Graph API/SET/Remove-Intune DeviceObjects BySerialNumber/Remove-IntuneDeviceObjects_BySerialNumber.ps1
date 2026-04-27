@@ -72,6 +72,7 @@
 
 
 #region --- CONFIGURATION -------------------------------------------------------
+
 $TenantID     = ""
 $ClientID     = ""
 $ClientSecret = ""
