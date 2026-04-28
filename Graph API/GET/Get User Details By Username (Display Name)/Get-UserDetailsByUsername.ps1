@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 # ==============================================================================
-# Script Name  : Get-UserEmailFromUsername.ps1
+# Script Name  : Get-UserDetailsByUsername.ps1
 # Description  : Resolves email addresses (UPN and mail) for one or more users
 #                by looking up their username (sAMAccountName / display name /
 #                full UPN) in Azure AD / Entra ID via Microsoft Graph API.
@@ -40,7 +40,9 @@
 #                  InputUsername, MatchCount, LookupStatus,
 #                  DisplayName, UserPrincipalName, Mail,
 #                  Department, JobTitle, OfficeLocation,
-#                  AccountEnabled, UserId
+#                  AccountEnabled, UserId,
+#                  CompanyName, UsageLocation,
+#                  Country, State, City, StreetAddress
 #
 #                LOOKUP STATUS VALUES:
 #                  FOUND          - exactly one match, email resolved
@@ -51,9 +53,9 @@
 #                READ ONLY: Only GET requests. No changes made anywhere.
 #
 # Author       : Sethu Kumar B
-# Version      : 2.0
+# Version      : 2.1
 # Created Date : 2026-04-15
-# Last Modified: 2026-04-15
+# Last Modified: 2026-04-28
 #
 # Requirements :
 #   - Azure AD App Registration (READ-ONLY)
@@ -74,6 +76,10 @@
 #                        Added PowerShell -ieq post-validation for guaranteed
 #                        case-insensitive exact character matching. Removed
 #                        startsWith passes to prevent partial matches.
+#
+#   v2.1 - 2026-04-28 - Sethu Kumar B - Added new output fields: CompanyName,
+#                        UsageLocation, Country, State, City, StreetAddress.
+#                        Updated $Select, Build-ResultRow, and CSV column docs.
 # ==============================================================================
 
 
@@ -271,7 +277,7 @@ function Resolve-UserByUsername {
     )
 
     # Fields to retrieve for each matched user
-    $Select = "id,displayName,userPrincipalName,mail,department,jobTitle,officeLocation,accountEnabled"
+    $Select = "id,displayName,userPrincipalName,mail,department,jobTitle,officeLocation,accountEnabled,companyName,usageLocation,country,state,city,streetAddress"
 
     # ------------------------------------------------------------------
     # Pass 1 - Exact UPN match
@@ -335,14 +341,20 @@ function Build-ResultRow {
         InputUsername     = $InputUsername
         MatchCount        = $MatchCount
         LookupStatus      = $LookupStatus
-        DisplayName       = if ($User -and $User.displayName)            { [string]$User.displayName }            else { "N/A" }
-        UserPrincipalName = if ($User -and $User.userPrincipalName)      { [string]$User.userPrincipalName }      else { "N/A" }
-        Mail              = if ($User -and $User.mail)                   { [string]$User.mail }                   else { "N/A" }
-        Department        = if ($User -and $User.department)             { [string]$User.department }             else { "N/A" }
-        JobTitle          = if ($User -and $User.jobTitle)               { [string]$User.jobTitle }               else { "N/A" }
-        OfficeLocation    = if ($User -and $User.officeLocation)         { [string]$User.officeLocation }         else { "N/A" }
-        AccountEnabled    = if ($User -and $null -ne $User.accountEnabled) { [string]$User.accountEnabled }       else { "N/A" }
-        UserId            = if ($User -and $User.id)                     { [string]$User.id }                     else { "N/A" }
+        DisplayName       = if ($User -and $User.displayName)              { [string]$User.displayName }              else { "N/A" }
+        UserPrincipalName = if ($User -and $User.userPrincipalName)        { [string]$User.userPrincipalName }        else { "N/A" }
+        Mail              = if ($User -and $User.mail)                     { [string]$User.mail }                     else { "N/A" }
+        Department        = if ($User -and $User.department)               { [string]$User.department }               else { "N/A" }
+        JobTitle          = if ($User -and $User.jobTitle)                 { [string]$User.jobTitle }                 else { "N/A" }
+        OfficeLocation    = if ($User -and $User.officeLocation)           { [string]$User.officeLocation }           else { "N/A" }
+        AccountEnabled    = if ($User -and $null -ne $User.accountEnabled) { [string]$User.accountEnabled }           else { "N/A" }
+        CompanyName       = if ($User -and $User.companyName)              { [string]$User.companyName }              else { "N/A" }
+        UsageLocation     = if ($User -and $User.usageLocation)            { [string]$User.usageLocation }            else { "N/A" }
+        Country           = if ($User -and $User.country)                  { [string]$User.country }                  else { "N/A" }
+        State             = if ($User -and $User.state)                    { [string]$User.state }                    else { "N/A" }
+        City              = if ($User -and $User.city)                     { [string]$User.city }                     else { "N/A" }
+        StreetAddress     = if ($User -and $User.streetAddress)            { [string]$User.streetAddress }            else { "N/A" }
+        UserId            = if ($User -and $User.id)                       { [string]$User.id }                       else { "N/A" }
     }
 }
 
@@ -355,7 +367,7 @@ function Build-ResultRow {
 try {
     [System.IO.File]::WriteAllText(
         $script:LogFile,
-        "Get-UserEmailFromUsername v2.0`r`nStarted : $(Get-Date)`r`nInput   : $InputPath`r`n`r`n",
+        "Get-UserEmailFromUsername v2.1`r`nStarted : $(Get-Date)`r`nInput   : $InputPath`r`n`r`n",
         [System.Text.Encoding]::UTF8
     )
 } catch {
@@ -365,7 +377,7 @@ try {
 # Banner
 Write-Host ""
 Write-Host "================================================================" -ForegroundColor Cyan
-Write-Host "  Get User Email from Username  |  Sethu Kumar B  |  v2.0      " -ForegroundColor Cyan
+Write-Host "  Get User Email from Username  |  Sethu Kumar B  |  v2.1      " -ForegroundColor Cyan
 Write-Host "  READ ONLY - No changes made to any system                     " -ForegroundColor Cyan
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Log "" -Level BLANK
@@ -521,7 +533,7 @@ if ($Results.Count -gt 0) {
         $Results | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
         $SizeMB = ((Get-Item $OutputFile).Length / 1MB).ToString("0.00")
         Write-Log "CSV exported successfully." -Level SUCCESS
-        Write-Log "  Path : $OutputFile"                         -Level INFO
+        Write-Log "  Path : $OutputFile"                             -Level INFO
         Write-Log "  Rows : $($Results.Count)  |  Size: $SizeMB MB" -Level INFO
     }
     catch {
