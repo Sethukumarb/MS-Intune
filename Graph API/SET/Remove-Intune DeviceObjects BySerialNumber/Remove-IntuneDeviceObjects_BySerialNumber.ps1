@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 # ==============================================================================
-# Script Name  : Remove-IntuneDeviceObjects.ps1
+# Script Name  : Remove-AutopilotDeviceBySerialNumber.ps1
 # Description  : Deletes Intune managed device and Windows Autopilot device
 #                identity records for devices identified by serial number.
 #
