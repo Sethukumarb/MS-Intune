@@ -22,7 +22,7 @@
 #                  Review output CSV then set $DryRun = $false to execute.
 #
 #                INPUT FILE:
-#                  input.txt - same folder as this script
+#                  remove_inputserialnumbers.txt - same folder as this script
 #                  One serial number per line. # comments and blank lines ignored.
 #
 #                OUTPUT FILES (saved to $PSScriptRoot):
@@ -45,9 +45,9 @@
 #                  SKIPPED       - Not attempted (no permission or not applicable)
 #
 # Author       : Sethu Kumar B
-# Version      : 1.3
+# Version      : 1.8
 # Created Date : 2026-04-17
-# Last Modified: 2026-04-17
+# Last Modified: 2026-04-29
 #
 # Permissions required (admin consent granted):
 #   DeviceManagementManagedDevices.ReadWrite.All  - read + delete Intune devices
@@ -58,16 +58,21 @@
 #   v1.1 - 2026-04-17 - Sethu Kumar B - Fixed duplicate handling.
 #   v1.2 - 2026-04-17 - Sethu Kumar B - Duplicate warning input-only.
 #   v1.3 - 2026-04-17 - Sethu Kumar B - Windows OS filter on Intune pull.
-#                        input serials (not all 1113 tenant serials). Added
 #                        Azure AD device lookup per Intune record - reports
 #                        found/not found, no delete. Azure AD count in summary.
 #                        Separate CSV row per Azure AD entry. Fixed DupeLabel
-#                        string interpolation bug.: hashtables
-#                        now store List of ALL records per serial. Processing
-#                        loop iterates every duplicate independently - one
-#                        DELETE per record, one CSV row per record.
-#                        RecordType column added: Intune / Intune (Duplicate N/M)
-#                        Duplicate serials flagged in log as WARN during pull.
+#                        string interpolation bug. Hashtables now store List of
+#                        ALL records per serial. Processing loop iterates every
+#                        duplicate independently. RecordType column added.
+#   v1.4 - 2026-04-29 - Sethu Kumar B - FIX: $_.Exception.Response null guard.
+#   v1.5 - 2026-04-29 - Sethu Kumar B - FIX: PS 5.1 strict mode crash on
+#   v1.6 - 2026-04-29 - Sethu Kumar B - FIX: @odata.nextLink + .Count crash.
+#   v1.7 - 2026-04-29 - Sethu Kumar B - FIX: PS 5.1 rejects [array](if...) cast.
+#   v1.8 - 2026-04-29 - Sethu Kumar B - Added $MaxBatchSize config. Aborts before
+#                        auth/pull if input exceeds cap. 0 = no limit.
+#                        .Response access. Replaced all direct .Response checks
+#                        with PSObject.Properties[] safe lookup pattern.
+#                        Strict mode throws BEFORE if-check on missing props.
 # ==============================================================================
 
 
@@ -93,7 +98,12 @@ $InputFileName = "remove_inputserialnumbers.txt"
 $InputPath     = Join-Path $PSScriptRoot $InputFileName
 
 # -- THROTTLE ------------------------------------------------------------------
-$MaxRetries = 5
+$MaxRetries    = 5
+
+# -- BATCH CAP ----------------------------------------------------------------
+# Abort if input exceeds this count. Safety gate before live deletions.
+# Change to any number you need (e.g. 50, 500, 5000). 0 = no limit.
+$MaxBatchSize  = 1
 
 #endregion ----------------------------------------------------------------------
 
@@ -112,7 +122,7 @@ try { Start-Transcript -Path $TranscriptFile -Force | Out-Null } catch { }
 
 try {
     [System.IO.File]::WriteAllText($script:LogFile,
-        "Remove-IntuneDeviceObjects v1.0`r`nStarted: $(Get-Date)`r`nDryRun: $DryRun`r`n`r`n",
+        "Remove-AutopilotDeviceBySerialNumber v1.8`r`nStarted: $(Get-Date)`r`nDryRun: $DryRun`r`n`r`n",
         [System.Text.Encoding]::UTF8)
 } catch { $script:LogFile = $null }
 
@@ -159,13 +169,25 @@ function Get-GraphToken {
         Write-Log "Access token acquired." -Level SUCCESS
         return $r.access_token
     }
-    catch { Write-Log "Authentication failed: $_" -Level ERROR; exit 1 }
+    catch {
+        # FIX v1.5: PSObject.Properties safe lookup - PS5.1 strict mode throws
+        # BEFORE evaluating if($_.Exception.Response) when property missing.
+        $ErrCode = $null
+        if ($null -ne $_.Exception.PSObject.Properties['Response'] -and $null -ne $_.Exception.Response) {
+            $ErrCode = $_.Exception.Response.StatusCode.value__
+        }
+        $ErrMsg = if ($ErrCode) { "HTTP $ErrCode - $($_.Exception.Message)" } else { $_.Exception.Message }
+        Write-Log "Authentication failed: $ErrMsg" -Level ERROR
+        exit 1
+    }
 }
 
 
 # -----------------------------------------------------------------------------
 # Invoke-GraphGetAllPages
 # Bulk paginated GET with PS 5.1-compatible 429 retry + exponential backoff.
+# FIX v1.4: Null-guard on $_.Exception.Response before accessing StatusCode.
+#            Prevents "property 'Response' cannot be found" on network errors.
 # -----------------------------------------------------------------------------
 function Invoke-GraphGetAllPages {
     param (
@@ -195,11 +217,16 @@ function Invoke-GraphGetAllPages {
                 $Total += $Count
                 Write-Log "  Page $Page - $Count records (total: $Total)" -Level INFO
                 foreach ($rec in $r.value) { $AllRecords.Add($rec) }
-                $Uri     = $r.'@odata.nextLink'
+                $Uri     = if ($null -ne $r.PSObject.Properties['@odata.nextLink']) { $r.'@odata.nextLink' } else { $null }
                 $Success = $true
             }
             catch {
-                $Code = $_.Exception.Response.StatusCode.value__
+                # FIX v1.5: PSObject.Properties safe lookup - avoids strict mode crash
+                $Code = $null
+                if ($null -ne $_.Exception.PSObject.Properties['Response'] -and $null -ne $_.Exception.Response) {
+                    $Code = $_.Exception.Response.StatusCode.value__
+                }
+
                 if ($Code -eq 429) {
                     $Wait = 60
                     try {
@@ -211,9 +238,18 @@ function Invoke-GraphGetAllPages {
                         Write-Log "  429 throttled - waiting ${Wait}s (retry $Attempt/$MaxRetries)..." -Level WARN
                         Start-Sleep -Seconds $Wait
                     }
-                    else { Write-Log "  429 persisted after $MaxRetries attempts. Skipping page." -Level WARN; $Uri = $null; $Success = $true }
+                    else {
+                        Write-Log "  429 persisted after $MaxRetries attempts. Skipping page." -Level WARN
+                        $Uri     = $null
+                        $Success = $true
+                    }
                 }
-                else { Write-Log "  Page $Page failed - HTTP $Code" -Level ERROR; $Uri = $null; $Success = $true }
+                else {
+                    $ErrDetail = if ($Code) { "HTTP $Code" } else { "No HTTP response (network/timeout/auth error)" }
+                    Write-Log "  Page $Page failed - $ErrDetail : $($_.Exception.Message)" -Level ERROR
+                    $Uri     = $null
+                    $Success = $true
+                }
             }
         } while (-not $Success -and $Attempt -lt $MaxRetries)
 
@@ -246,7 +282,8 @@ function Get-AzureADDevice {
 
 # -----------------------------------------------------------------------------
 # Invoke-GraphDelete
-# Single DELETE request. Returns $true on success (204), $false on failure.
+# Single DELETE request. Returns $true on success (204), throws on failure.
+# FIX v1.4: Null-guard on $_.Exception.Response before accessing StatusCode.
 # -----------------------------------------------------------------------------
 function Invoke-GraphDelete {
     param ([string]$Uri, [string]$AccessToken)
@@ -256,8 +293,13 @@ function Invoke-GraphDelete {
         return $true
     }
     catch {
-        $Code = $_.Exception.Response.StatusCode.value__
-        throw "HTTP $Code : $($_.Exception.Message)"
+        # FIX v1.5: PSObject.Properties safe lookup - avoids strict mode crash
+        $Code = $null
+        if ($null -ne $_.Exception.PSObject.Properties['Response'] -and $null -ne $_.Exception.Response) {
+            $Code = $_.Exception.Response.StatusCode.value__
+        }
+        $ErrDetail = if ($Code) { "HTTP $Code" } else { "No HTTP response (network/timeout/auth error)" }
+        throw "$ErrDetail : $($_.Exception.Message)"
     }
 }
 
@@ -270,14 +312,14 @@ function Invoke-GraphDelete {
 Write-Host ""
 if ($DryRun) {
     Write-Host "================================================================" -ForegroundColor Cyan
-    Write-Host "  Remove-IntuneDeviceObjects  |  DRY RUN - NO DELETES          " -ForegroundColor Cyan
+    Write-Host "  Remove-AutopilotDeviceBySerialNumber  |  DRY RUN             " -ForegroundColor Cyan
     Write-Host "  Sethu Kumar B                                                 " -ForegroundColor Cyan
     Write-Host "  Review CSV output then set DryRun = false to execute.         " -ForegroundColor Cyan
     Write-Host "================================================================" -ForegroundColor Cyan
 }
 else {
     Write-Host "================================================================" -ForegroundColor Red
-    Write-Host "  Remove-IntuneDeviceObjects  |  LIVE - DELETES WILL EXECUTE   " -ForegroundColor Red
+    Write-Host "  Remove-AutopilotDeviceBySerialNumber  |  LIVE - DELETES NOW  " -ForegroundColor Red
     Write-Host "  Sethu Kumar B                                                 " -ForegroundColor Red
     Write-Host "  !! DEVICE RECORDS WILL BE PERMANENTLY DELETED !!             " -ForegroundColor Red
     Write-Host "================================================================" -ForegroundColor Red
@@ -299,7 +341,7 @@ Write-Log "==========================================================" -Level SE
 
 if (-not (Test-Path $InputPath)) {
     Write-Log "Input file not found: $InputPath" -Level ERROR
-    Write-Log "Create input.txt with one serial number per line." -Level ERROR
+    Write-Log "Create $InputFileName with one serial number per line." -Level ERROR
     try { Stop-Transcript | Out-Null } catch { }
     exit 1
 }
@@ -316,6 +358,12 @@ if ($Serials.Count -eq 0) {
     Write-Log "No serials found. Exiting." -Level WARN
     try { Stop-Transcript | Out-Null } catch { }
     exit 0
+}
+if ($MaxBatchSize -gt 0 -and $Serials.Count -gt $MaxBatchSize) {
+    Write-Log "BATCH CAP EXCEEDED: $($Serials.Count) serials in input, limit is $MaxBatchSize." -Level ERROR
+    Write-Log "Reduce input file or increase $MaxBatchSize in config. Exiting." -Level ERROR
+    try { Stop-Transcript | Out-Null } catch { }
+    exit 1
 }
 foreach ($s in $Serials) { Write-Log "  -> $s" -Level INFO }
 Write-Log "" -Level BLANK
@@ -414,8 +462,12 @@ foreach ($Serial in $Serials) {
     $SerialKey = $Serial.ToLower().Trim()
 
     # Get ALL Intune and Autopilot records for this serial
-    $IntuneDevices = if ($IntuneBySerial.ContainsKey($SerialKey)) { $IntuneBySerial[$SerialKey] } else { [System.Collections.Generic.List[PSObject]]::new() }
-    $APDevices     = if ($APBySerial.ContainsKey($SerialKey))     { $APBySerial[$SerialKey] }     else { [System.Collections.Generic.List[PSObject]]::new() }
+    # FIX v1.7: PS 5.1 does not support [array](if ...) cast syntax.
+    # Split into two steps: assign then cast via @().
+    if ($IntuneBySerial.ContainsKey($SerialKey)) { $IntuneDevices = $IntuneBySerial[$SerialKey] } else { $IntuneDevices = @() }
+    if ($APBySerial.ContainsKey($SerialKey))     { $APDevices     = $APBySerial[$SerialKey] }     else { $APDevices     = @() }
+    $IntuneDevices = @($IntuneDevices)
+    $APDevices     = @($APDevices)
 
     $IntuneCount = $IntuneDevices.Count
     $APCount     = $APDevices.Count
@@ -499,10 +551,6 @@ foreach ($Serial in $Serials) {
     if (-not $DryRun -and $IntuneDevices.Count -gt 0) { Start-Sleep -Seconds 2 }
 
     # -- Azure AD lookup (report only - no delete) ----------------------------
-    # Look up Azure AD device object for each Intune record.
-    # Requires Device.Read.All on the app registration.
-    # If permission not granted, lookup returns null and is logged as SKIPPED.
-    # Either way no delete is attempted - Azure AD is reporting only.
     $AzureADFoundCount = 0
     foreach ($IntuneDevice in $IntuneDevices) {
         $AzureADId = if ($IntuneDevice.azureADDeviceId) { [string]$IntuneDevice.azureADDeviceId } else { "N/A" }
@@ -621,6 +669,7 @@ Write-Host ""
 Write-Host "================================================================" -ForegroundColor $(if ($DryRun) {"Cyan"} else {"Red"})
 Write-Host "  $(if ($DryRun) {'DRY RUN COMPLETE - NO CHANGES MADE'} else {'DELETIONS COMPLETE'})" -ForegroundColor $(if ($DryRun) {"Cyan"} else {"Red"})
 Write-Host "================================================================" -ForegroundColor $(if ($DryRun) {"Cyan"} else {"Red"})
+
 # Build per-input-serial duplicate summary
 $InputDupeReport = [System.Collections.Generic.List[string]]::new()
 foreach ($s in $Serials) {
@@ -631,6 +680,7 @@ foreach ($s in $Serials) {
         $InputDupeReport.Add("  $s : Intune=$iCount  Autopilot=$aCount")
     }
 }
+
 $AzureADFoundTotal = @($Results | Where-Object { $_.RecordType -eq "Azure AD" -and $_.AzureADStatus -like "*exists*" }).Count
 $AzureADRows       = @($Results | Where-Object { $_.RecordType -eq "Azure AD" }).Count
 
@@ -655,6 +705,10 @@ Write-Log "  Log file     : $($script:LogFile)"  -Level INFO
 Write-Log "  Transcript   : $TranscriptFile"     -Level INFO
 Write-Host "================================================================" -ForegroundColor $(if ($DryRun) {"Cyan"} else {"Red"})
 Write-Host ""
+
+# Clear credentials
+$ClientSecret = ""
+$Token        = ""
 
 try { Stop-Transcript | Out-Null } catch { }
 
