@@ -51,9 +51,9 @@
 #                  BatchNumber, SubmittedAt, StatusCheckedAt
 #
 # Author       : Sethu Kumar B
-# Version      : 1.5
+# Version      : 1.9
 # Created Date : 2026-04-17
-# Last Modified: 2026-04-27
+# Last Modified: 2026-04-30
 #
 # Requirements :
 #   - Azure AD App Registration
@@ -77,6 +77,25 @@
 #                        204. Added Get-ImportedDevicesBySerial to resolve IDs via
 #                        GET after submit. groupTag and productKey omitted entirely
 #                        when blank instead of sending empty string.
+#   v1.6 - 2026-04-30 - Sethu Kumar B - Fixed "Cannot find property Count" error when
+#                        CSV contains a single row. Import-Csv returns a bare
+#                        PSCustomObject (not an array) for single-row files.
+#                        Wrapped Import-Csv result in @() to force array type.
+#   v1.7 - 2026-04-30 - Sethu Kumar B - Fixed "Cannot find property Count" on $Missing.
+#                        Where-Object returns bare string (not array) when pipeline
+#                        yields one item. Wrapped in @() to force array type.
+#   v1.8 - 2026-04-30 - Sethu Kumar B - Fixed "Cannot find property Response" in
+#                        Get-ImportedDevicesBySerial and Get-ImportStatus. Graph API
+#                        may return single object without .value wrapper. Added
+#                        PSObject.Properties check before accessing .value and
+#                        @odata.nextLink. Improved catch block error logging.
+#   v1.9 - 2026-04-30 - Sethu Kumar B - Fixed false status reporting on re-runs.
+#                        Staging endpoint retains records from previous runs. Serial
+#                        lookup was picking up stale records causing completed devices
+#                        to falsely report 806/ZtdDeviceAlreadyAssigned on run 2+.
+#                        Get-ImportedDevicesBySerial now accepts BatchSubmitTime and
+#                        filters to records created at or after submit time. When
+#                        multiple records exist for same serial, most recent wins.
 # ==============================================================================
 
 
@@ -116,7 +135,7 @@ try { Start-Transcript -Path $TranscriptFile -Force | Out-Null } catch { }
 
 try {
     [System.IO.File]::WriteAllText($script:LogFile,
-        "Import-AutopilotDevices v1.5`r`nStarted: $(Get-Date)`r`n`r`n",
+        "Import-AutopilotDevices v1.9`r`nStarted: $(Get-Date)`r`n`r`n",
         [System.Text.Encoding]::UTF8)
 } catch { $script:LogFile = $null }
 
@@ -245,9 +264,17 @@ function Submit-AutopilotBatch {
 # Queries importedWindowsAutopilotDeviceIdentities and returns a hashtable
 # keyed by serialNumber (lowercase) -> record object.
 # Used after batch submit to resolve IDs since /import returns 204 (no body).
+#
+# FIX v1.9: Accepts BatchSubmitTime. Only records created at or after that
+# time are considered. This prevents stale records from previous runs being
+# picked up when the same device serial exists in the staging endpoint.
+# When multiple records share the same serial, most recently created wins.
 # -----------------------------------------------------------------------------
 function Get-ImportedDevicesBySerial {
-    param ([string]$AccessToken)
+    param (
+        [string]$AccessToken,
+        [datetime]$BatchSubmitTime
+    )
 
     $Headers = @{ Authorization = "Bearer $AccessToken"; "Content-Type" = "application/json" }
     $Uri     = "https://graph.microsoft.com/beta/deviceManagement/importedWindowsAutopilotDeviceIdentities?`$top=1000"
@@ -255,20 +282,43 @@ function Get-ImportedDevicesBySerial {
 
     do {
         try {
-            $r = Invoke-RestMethod -Method GET -Uri $Uri -Headers $Headers -ErrorAction Stop
-            foreach ($rec in $r.value) { $All.Add($rec) }
-            $Uri = $r.'@odata.nextLink'
+            $r   = Invoke-RestMethod -Method GET -Uri $Uri -Headers $Headers -ErrorAction Stop
+            $Arr = if ($r.PSObject.Properties["value"]) { @($r.value) } else { @($r) }
+            foreach ($rec in $Arr) {
+                if (-not $rec) { continue }
+                # Only accept records created at or after batch submit time
+                if ($rec.PSObject.Properties["createdDateTime"] -and $rec.createdDateTime) {
+                    try {
+                        $RecTime = [datetime]::Parse($rec.createdDateTime)
+                        if ($RecTime -ge $BatchSubmitTime) { $All.Add($rec) }
+                    }
+                    catch { $All.Add($rec) }   # parse failure - include to be safe
+                }
+                else { $All.Add($rec) }        # no timestamp field - include to be safe
+            }
+            $Uri = if ($r.PSObject.Properties["@odata.nextLink"]) { $r.'@odata.nextLink' } else { $null }
         }
         catch {
-            Write-Log "  Serial lookup poll failed: $($_.Exception.Response.StatusCode.value__)" -Level WARN
+            Write-Log "  Serial lookup poll failed: $_" -Level WARN
             $Uri = $null
         }
     } while ($Uri)
 
+    # Build lookup - when multiple records share same serial, keep most recent
     $Lookup = @{}
     foreach ($item in $All) {
-        if ($item.serialNumber) {
-            $Lookup[$item.serialNumber.ToLower()] = $item
+        if (-not $item.serialNumber) { continue }
+        $key = $item.serialNumber.ToLower()
+        if (-not $Lookup.ContainsKey($key)) {
+            $Lookup[$key] = $item
+        }
+        else {
+            try {
+                $existing = [datetime]::Parse($Lookup[$key].createdDateTime)
+                $current  = [datetime]::Parse($item.createdDateTime)
+                if ($current -gt $existing) { $Lookup[$key] = $item }
+            }
+            catch { }   # keep existing on parse failure
         }
     }
     return $Lookup
@@ -289,12 +339,13 @@ function Get-ImportStatus {
 
     do {
         try {
-            $r = Invoke-RestMethod -Method GET -Uri $Uri -Headers $Headers -ErrorAction Stop
-            foreach ($rec in $r.value) { $All.Add($rec) }
-            $Uri = $r.'@odata.nextLink'
+            $r   = Invoke-RestMethod -Method GET -Uri $Uri -Headers $Headers -ErrorAction Stop
+            $Arr = if ($r.PSObject.Properties["value"]) { @($r.value) } else { @($r) }
+            foreach ($rec in $Arr) { if ($rec) { $All.Add($rec) } }
+            $Uri = if ($r.PSObject.Properties["@odata.nextLink"]) { $r.'@odata.nextLink' } else { $null }
         }
         catch {
-            Write-Log "Status poll failed: $($_.Exception.Response.StatusCode.value__)" -Level WARN
+            Write-Log "Status poll failed: $_" -Level WARN
             $Uri = $null
         }
     } while ($Uri)
@@ -420,7 +471,8 @@ $SkippedFiles    = 0
 foreach ($File in $CsvFiles) {
     Write-Log "Loading: $($File.Name)" -Level INFO
     try {
-        $Data = Import-Csv -Path $File.FullName -ErrorAction Stop
+        # @() forces array - Import-Csv returns bare PSCustomObject for single-row files
+        $Data = @(Import-Csv -Path $File.FullName -ErrorAction Stop)
 
         if ($Data.Count -eq 0) {
             Write-Log "  SKIPPED - file is empty." -Level WARN
@@ -429,7 +481,8 @@ foreach ($File in $CsvFiles) {
         }
 
         $Columns = $Data[0].PSObject.Properties.Name
-        $Missing = $RequiredColumns | Where-Object { $Columns -notcontains $_ }
+        # @() forces array - Where-Object returns bare string when only one item matches
+        $Missing = @($RequiredColumns | Where-Object { $Columns -notcontains $_ })
         if ($Missing.Count -gt 0) {
             Write-Log "  SKIPPED - missing required column(s): $($Missing -join ', ')" -Level ERROR
             $SkippedFiles++
@@ -500,10 +553,12 @@ $AllImportedIDs = [System.Collections.Generic.List[string]]::new()
 $ImportedIdMap  = @{}
 
 for ($i = 0; $i -lt $TotalDevices; $i += $BatchSize) {
-    $BatchNum    = $BatchNum + 1
-    $BatchEnd    = [math]::Min($i + $BatchSize - 1, $TotalDevices - 1)
-    $Batch       = $AllDevicesList[$i..$BatchEnd]
-    $SubmittedAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $BatchNum        = $BatchNum + 1
+    $BatchEnd        = [math]::Min($i + $BatchSize - 1, $TotalDevices - 1)
+    $Batch           = $AllDevicesList[$i..$BatchEnd]
+    $SubmittedAt     = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    # Capture submit time as [datetime] for stale record filtering (v1.9)
+    $BatchSubmitTime = Get-Date
 
     Write-Log "Batch $BatchNum of $TotalBatches - submitting $($Batch.Count) device(s)..." -Level INFO
 
@@ -515,7 +570,8 @@ for ($i = 0; $i -lt $TotalDevices; $i += $BatchSize) {
         Write-Log "  Waiting 10s for staging records to appear..." -Level INFO
         Start-Sleep -Seconds 10
 
-        $SerialMap = Get-ImportedDevicesBySerial -AccessToken $Token
+        # Pass BatchSubmitTime so stale records from previous runs are excluded
+        $SerialMap = Get-ImportedDevicesBySerial -AccessToken $Token -BatchSubmitTime $BatchSubmitTime
 
         foreach ($d in $Batch) {
             $snKey    = $d.SerialNumber.ToLower()
